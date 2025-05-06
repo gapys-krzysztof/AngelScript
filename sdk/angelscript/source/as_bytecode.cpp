@@ -1,6 +1,6 @@
 /*
    AngelCode Scripting Library
-   Copyright (c) 2003-2018 Andreas Jonsson
+   Copyright (c) 2003-2022 Andreas Jonsson
 
    This software is provided 'as-is', without any express or implied
    warranty. In no event will the authors be held liable for any
@@ -2136,6 +2136,9 @@ void asCByteCode::PostProcess()
 #ifdef AS_DEBUG
 void asCByteCode::DebugOutput(const char *name, asCScriptFunction *func)
 {
+	if (engine->ep.noDebugOutput)
+		return;
+
 #ifndef __MINGW32__
 	// _mkdir is broken on mingw
 	_mkdir("AS_DEBUG");
@@ -2156,7 +2159,9 @@ void asCByteCode::DebugOutput(const char *name, asCScriptFunction *func)
 	FILE *file = fopen(path.AddressOf(), "w");
 #endif
 
-#if !defined(AS_XENON) // XBox 360: When running in DVD Emu, no write is allowed
+#if !defined(AS_XENON) && !defined(__MINGW32__)
+	// XBox 360: When running in DVD Emu, no write is allowed
+	// MinGW: As _mkdir is broken, don't assert on file not created if the AS_DEBUG directory doesn't exist
 	asASSERT( file );
 #endif
 
@@ -2179,59 +2184,12 @@ void asCByteCode::DebugOutput(const char *name, asCScriptFunction *func)
 	fprintf(file, "Variables: \n");
 	for( n = 0; n < func->scriptData->variables.GetLength(); n++ )
 	{
-		int idx = func->scriptData->objVariablePos.IndexOf(func->scriptData->variables[n]->stackOffset);
-		bool isOnHeap = asUINT(idx) < func->scriptData->objVariablesOnHeap ? true : false;
+		bool isOnHeap = func->scriptData->variables[n]->onHeap;
 		fprintf(file, " %.3d: %s%s %s\n", func->scriptData->variables[n]->stackOffset, isOnHeap ? "(heap) " : "", func->scriptData->variables[n]->type.Format(func->nameSpace, true).AddressOf(), func->scriptData->variables[n]->name.AddressOf());
 	}
-	asUINT offset = 0;
 	if( func->objectType )
-	{
 		fprintf(file, " %.3d: %s this\n", 0, func->objectType->name.AddressOf());
-		offset -= AS_PTR_SIZE;
-	}
-	for( n = 0; n < func->parameterTypes.GetLength(); n++ )
-	{
-		bool found = false;
-		for( asUINT v = 0; v < func->scriptData->variables.GetLength(); v++ )
-		{
-			if( func->scriptData->variables[v]->stackOffset == (int)offset )
-			{
-				found = true;
-				break;
-			}
-		}
-		if( !found )
-		{
-			int idx = func->scriptData->objVariablePos.IndexOf(offset);
-			bool isOnHeap = asUINT(idx) < func->scriptData->objVariablesOnHeap ? true : false;
-			fprintf(file, " %.3d: %s%s {noname param}\n", offset, isOnHeap ? "(heap) " : "", func->parameterTypes[n].Format(func->nameSpace, true).AddressOf());
-		}
 
-		offset -= func->parameterTypes[n].GetSizeOnStackDWords();
-	}
-	for( n = 0; n < func->scriptData->objVariablePos.GetLength(); n++ )
-	{
-		bool found = false;
-		for( asUINT v = 0; v < func->scriptData->variables.GetLength(); v++ )
-		{
-			if( func->scriptData->variables[v]->stackOffset == func->scriptData->objVariablePos[n] )
-			{
-				found = true;
-				break;
-			}
-		}
-		if( !found )
-		{
-			if( func->scriptData->objVariableTypes[n] )
-			{
-				int idx = func->scriptData->objVariablePos.IndexOf(func->scriptData->objVariablePos[n]);
-				bool isOnHeap = asUINT(idx) < func->scriptData->objVariablesOnHeap ? true : false;
-				fprintf(file, " %.3d: %s%s {noname}\n", func->scriptData->objVariablePos[n], isOnHeap ? "(heap) " : "", func->scriptData->objVariableTypes[n]->name.AddressOf());
-			}
-			else
-				fprintf(file, " %.3d: null handle {noname}\n", func->scriptData->objVariablePos[n]);
-		}
-	}
 	fprintf(file, "\n\n");
 
 	bool invalidStackSize = false;

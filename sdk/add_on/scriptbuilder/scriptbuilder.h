@@ -167,17 +167,17 @@ protected:
 	std::string currentNamespace;
 
 	// Storage of metadata for global declarations
-	std::map<int, std::vector<std::string>> typeMetadataMap;
-	std::map<int, std::vector<std::string>> funcMetadataMap;
-	std::map<int, std::vector<std::string>> varMetadataMap;
+	std::map<int, std::vector<std::string> > typeMetadataMap;
+	std::map<int, std::vector<std::string> > funcMetadataMap;
+	std::map<int, std::vector<std::string> > varMetadataMap;
 
 	// Storage of metadata for class member declarations
 	struct SClassMetadata
 	{
 		SClassMetadata(const std::string& aName) : className(aName) {}
 		std::string className;
-		std::map<int, std::vector<std::string>> funcMetadataMap;
-		std::map<int, std::vector<std::string>> varMetadataMap;
+		std::map<int, std::vector<std::string> > funcMetadataMap;
+		std::map<int, std::vector<std::string> > varMetadataMap;
 	};
 	std::map<int, SClassMetadata> classMetadataMap;
 
@@ -200,7 +200,7 @@ protected:
 	{
 		bool operator()(const std::string &a, const std::string &b) const
 		{
-			return _strcmpi(a.c_str(), b.c_str()) < 0;
+			return _stricmp(a.c_str(), b.c_str()) < 0;
 		}
 	};
 	std::set<std::string, ci_less> includedScripts;

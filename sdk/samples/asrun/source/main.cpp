@@ -4,7 +4,15 @@
 #include <vector>
 #include <stdlib.h>  // system()
 #include <stdio.h>
+
+#if defined(_MSC_VER) && !defined(_WIN32_WCE) && !defined(__S3E__)
 #include <direct.h>  // _chdir()
+#endif
+#if defined(__S3E__) || defined(__APPLE__) || defined(__GNUC__)
+#include <unistd.h> // chdir()
+#define _chdir(x) chdir(x)
+#endif
+
 #include <sstream>   // stringstream
 #include <angelscript.h>
 #include "../../../add_on/scriptbuilder/scriptbuilder.h"
@@ -21,6 +29,10 @@
 #ifdef _WIN32
 #include <Windows.h> // WriteConsoleW
 #include <TlHelp32.h> // CreateToolhelp32Snapshot, Process32First, Process32Next
+
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
 #endif
 
 #if defined(_MSC_VER)
@@ -40,6 +52,7 @@ void              ReturnContextCallback(asIScriptEngine *engine, asIScriptContex
 void              PrintString(const string &str);
 string            GetInput();
 int               ExecSystemCmd(const string &cmd);
+int               ExecSystemCmd(const string &str, string &out);
 CScriptArray     *GetCommandLineArgs();
 void              SetWorkDir(const string &file);
 void              WaitForUser();
@@ -69,6 +82,23 @@ int main(int argc, char **argv)
 	_CrtSetReportFile(_CRT_ASSERT,_CRTDBG_FILE_STDERR);
 
 	// Use _CrtSetBreakAlloc(n) to find a specific memory leak
+#endif
+
+#if defined(_WIN32)
+	// Turn on support for virtual terminal sequences to add support for colored text in the console
+	// Ref: https://docs.microsoft.com/en-us/windows/console/console-virtual-terminal-sequences
+	// Ref: https://stackoverflow.com/questions/2048509/how-to-echo-with-different-colors-in-the-windows-command-line
+	HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut == INVALID_HANDLE_VALUE)
+		return -1;
+
+    DWORD dwMode = 0;
+    if (!GetConsoleMode(hOut, &dwMode))
+		return -1;
+
+    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    if (!SetConsoleMode(hOut, dwMode))
+		return -1;
 #endif
 
 	int r;
@@ -164,16 +194,17 @@ int ConfigureEngine(asIScriptEngine *engine)
 	RegisterScriptArray(engine, false);
 	RegisterStdStringUtils(engine);
 	RegisterScriptDictionary(engine);
+	RegisterScriptDateTime(engine);
 	RegisterScriptFile(engine);
 	RegisterScriptFileSystem(engine);
-	RegisterScriptDateTime(engine);
 	RegisterExceptionRoutines(engine);
 
 	// Register a couple of extra functions for the scripts
 	r = engine->RegisterGlobalFunction("void print(const string &in)", asFUNCTION(PrintString), asCALL_CDECL); assert( r >= 0 );
 	r = engine->RegisterGlobalFunction("string getInput()", asFUNCTION(GetInput), asCALL_CDECL); assert(r >= 0);
 	r = engine->RegisterGlobalFunction("array<string> @getCommandLineArgs()", asFUNCTION(GetCommandLineArgs), asCALL_CDECL); assert( r >= 0 );
-	r = engine->RegisterGlobalFunction("int exec(const string &in)", asFUNCTION(ExecSystemCmd), asCALL_CDECL); assert( r >= 0 );
+	r = engine->RegisterGlobalFunction("int exec(const string &in)", asFUNCTIONPR(ExecSystemCmd, (const string &), int), asCALL_CDECL); assert( r >= 0 );
+	r = engine->RegisterGlobalFunction("int exec(const string &in, string &out)", asFUNCTIONPR(ExecSystemCmd, (const string &, string &), int), asCALL_CDECL); assert( r >= 0 );
 
 	// Setup the context manager and register the support for co-routines
 	g_ctxMgr = new CContextMgr();
@@ -268,6 +299,18 @@ std::string DictionaryToString(void *obj, int expandMembers, CDebugger *dbg)
 	return s.str();
 }
 
+// This is the to-string callback for the dictionary type
+std::string DateTimeToString(void *obj, int expandMembers, CDebugger *dbg)
+{
+	CDateTime *dt = reinterpret_cast<CDateTime*>(obj);
+	
+	std::stringstream s;
+	s << "{" << dt->getYear() << "-" << dt->getMonth() << "-" << dt->getDay() << " ";
+	s << dt->getHour() << ":" << dt->getMinute() << ":" << dt->getSecond() << "}";
+	
+	return s.str(); 
+}
+
 // This function initializes the debugger and let's the user set initial break points
 void InitializeDebugger(asIScriptEngine *engine)
 {
@@ -282,6 +325,7 @@ void InitializeDebugger(asIScriptEngine *engine)
 	g_dbg->RegisterToStringCallback(engine->GetTypeInfoByName("string"), StringToString);
 	g_dbg->RegisterToStringCallback(engine->GetTypeInfoByName("array"), ArrayToString);
 	g_dbg->RegisterToStringCallback(engine->GetTypeInfoByName("dictionary"), DictionaryToString);
+	g_dbg->RegisterToStringCallback(engine->GetTypeInfoByName("datetime"), DateTimeToString);
 
 	// Allow the user to initialize the debugging before moving on
 	cout << "Debugging, waiting for commands. Type 'h' for help." << endl;
@@ -444,8 +488,10 @@ void PrintString(const string &str)
 		// We're writing to a console window, so convert the UTF8 string to UTF16 and write with
 		// WriteConsoleW. Windows will then automatically display the characters correctly according
 		// to the user's settings
-		wchar_t bufUTF16[10000];
-		MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, bufUTF16, 10000);
+		// TODO: buffer size needs to be dynamic to handle large strings
+		//       must split the string correctly between UTF8 unicode sequences
+		wchar_t bufUTF16[100000];
+		MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, bufUTF16, 100000);
 		WriteConsoleW(console, bufUTF16, lstrlenW(bufUTF16), 0, 0);
 	}
 	else
@@ -469,7 +515,94 @@ string GetInput()
 // TODO: Perhaps it might be interesting to implement pipes so that the script can receive input from stdin, 
 //       or execute commands that return output similar to how popen is used
 
+// This function calls the system command, captures the stdout and return the status
+// Return of -1 indicates an error. Else the return code is the return status of the executed command
+// ref: https://stackoverflow.com/questions/478898/how-do-i-execute-a-command-and-get-the-output-of-the-command-within-c-using-po
+int ExecSystemCmd(const string &str, string &out)
+{
+#ifdef _WIN32
+	// Convert the command to UTF16 to properly handle unicode path names
+	wchar_t bufUTF16[10000];
+	MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, bufUTF16, 10000);
+	
+	// Create a pipe to capture the stdout from the system command
+	HANDLE pipeRead, pipeWrite;
+	SECURITY_ATTRIBUTES secAttr = {0};
+	secAttr.nLength = sizeof(SECURITY_ATTRIBUTES);
+    secAttr.bInheritHandle = TRUE;
+    secAttr.lpSecurityDescriptor = NULL;
+    if( !CreatePipe(&pipeRead, &pipeWrite, &secAttr, 0) )
+		return -1;
+	
+	// Start the process for the system command, informing the pipe to 
+	// capture stdout, and also to skip showing the command window
+	STARTUPINFOW si = {0};
+	si.cb          = sizeof(STARTUPINFOW);
+    si.dwFlags     = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.hStdOutput  = pipeWrite;
+    si.hStdError   = pipeWrite;
+    si.wShowWindow = SW_HIDE;
+	PROCESS_INFORMATION pi = {0};
+	BOOL success = CreateProcessW(NULL, bufUTF16, NULL, NULL, TRUE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi);
+    if( !success )
+    {
+        CloseHandle(pipeWrite);
+        CloseHandle(pipeRead);
+        return -1;
+    }
+	
+	// Run the command until the end, while capturing stdout
+	for(;;)
+	{
+		// Wait for a while to allow the process to work
+		DWORD ret = WaitForSingleObject(pi.hProcess, 50);
+		
+		// Read from the stdout if there is any data
+        for (;;)
+        {
+            char buf[1024];
+            DWORD readCount = 0;
+            DWORD availCount = 0;
+
+            if( !::PeekNamedPipe(pipeRead, NULL, 0, NULL, &availCount, NULL) )
+                break;
+
+            if( availCount == 0 )
+                break;
+
+            if( !::ReadFile(pipeRead, buf, sizeof(buf) - 1 < availCount ? sizeof(buf) - 1 : availCount, &readCount, NULL) || !readCount )
+                break;
+
+            buf[readCount] = 0;
+            out += buf;
+        }
+
+		// End the loop if the process finished
+		if( ret == WAIT_OBJECT_0 )
+			break;
+	}
+	
+	// Get the return status from the process
+	DWORD status = 0;
+	GetExitCodeProcess(pi.hProcess, &status);
+	
+	CloseHandle(pipeRead);
+	CloseHandle(pipeWrite);
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+		
+	return status;
+#else
+	// TODO: Implement suppor for ExecSystemCmd(const string &, string&) on non-Windows platforms
+	asIScriptContext *ctx = asGetActiveContext();
+	if( ctx )
+		ctx->SetException("Oops! This is not yet implemented on non-Windows platforms. Sorry!\n");
+	return -1;	
+#endif
+}
+
 // This function simply calls the system command and returns the status
+// Return of -1 indicates an error. Else the return code is the return status of the executed command
 int ExecSystemCmd(const string &str)
 {
 	// Check if the command line processor is available
@@ -487,7 +620,7 @@ int ExecSystemCmd(const string &str)
 	MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, bufUTF16, 10000);
 	return _wsystem(bufUTF16);
 #else
-	return system(cmd.c_str());
+	return system(str.c_str());
 #endif
 }
 
@@ -611,7 +744,6 @@ void WaitForUser()
 
 	if (name == L"explorer.exe")
 	{
-		//WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), name.c_str(), name.length(), 0, 0);
 		PrintString("\nPress enter to exit\n");
 		GetInput();
 	}

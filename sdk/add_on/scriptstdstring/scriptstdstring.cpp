@@ -2,7 +2,7 @@
 #include <assert.h> // assert()
 #include <sstream>  // std::stringstream
 #include <string.h> // strstr()
-#include <stdio.h>	// sprintf()
+#include <stdio.h>	// snprintf()
 #include <stdlib.h> // strtod()
 #ifndef __psp2__
 	#include <locale.h> // setlocale()
@@ -28,6 +28,7 @@ typedef map<string, int> map_t;
 END_AS_NAMESPACE
 #endif
 
+BEGIN_AS_NAMESPACE
 class CStdStringFactory : public asIStringFactory
 {
 public:
@@ -41,6 +42,10 @@ public:
 
 	const void *GetStringConstant(const char *data, asUINT length)
 	{
+		// The string factory might be modified from multiple 
+		// threads, so it is necessary to use a mutex.
+		asAcquireExclusiveLock();
+		
 		string str(data, length);
 		map_t::iterator it = stringCache.find(str);
 		if (it != stringCache.end())
@@ -48,6 +53,8 @@ public:
 		else
 			it = stringCache.insert(map_t::value_type(str, 1)).first;
 
+		asReleaseExclusiveLock();
+		
 		return reinterpret_cast<const void*>(&it->first);
 	}
 
@@ -56,14 +63,25 @@ public:
 		if (str == 0)
 			return asERROR;
 
+		int ret = asSUCCESS;
+		
+		// The string factory might be modified from multiple 
+		// threads, so it is necessary to use a mutex.
+		asAcquireExclusiveLock();
+		
 		map_t::iterator it = stringCache.find(*reinterpret_cast<const string*>(str));
 		if (it == stringCache.end())
-			return asERROR;
-
-		it->second--;
-		if (it->second == 0)
-			stringCache.erase(it);
-		return asSUCCESS;
+			ret = asERROR;
+		else
+		{
+			it->second--;
+			if (it->second == 0)
+				stringCache.erase(it);
+		}
+		
+		asReleaseExclusiveLock();
+		
+		return ret;
 	}
 
 	int  GetRawStringData(const void *str, char *data, asUINT *length) const
@@ -80,7 +98,7 @@ public:
 		return asSUCCESS;
 	}
 
-	// TODO: Make sure the access to the string cache is thread safe
+	// THe access to the string cache is protected with the common mutex provided by AngelScript
 	map_t stringCache;
 };
 
@@ -93,9 +111,15 @@ CStdStringFactory *GetStdStringFactorySingleton()
 {
 	if( stringFactory == 0 )
 	{
-		// The following instance will be destroyed by the global 
-		// CStdStringFactoryCleaner instance upon application shutdown
-		stringFactory = new CStdStringFactory();
+		// Make sure no other thread is creating the string factory at the same time
+		asAcquireExclusiveLock();
+		if (stringFactory == 0)
+		{
+			// The following instance will be destroyed by the global 
+			// CStdStringFactoryCleaner instance upon application shutdown
+			stringFactory = new CStdStringFactory();
+		}
+		asReleaseExclusiveLock();
 	}
 	return stringFactory;
 }
@@ -161,6 +185,7 @@ static bool StringIsEmpty(const string &str)
 	return str.empty();
 }
 
+#if AS_NO_IMPL_OPS_WITH_STRING_AND_PRIMITIVE == 0
 static string &AssignUInt64ToString(asQWORD i, string &dest)
 {
 	ostringstream stream;
@@ -310,6 +335,7 @@ static string AddBoolString(bool b, const string &str)
 	stream << (b ? "true" : "false");
 	return stream.str() + str;
 }
+#endif
 
 static char *StringCharAt(unsigned int i, string &str)
 {
@@ -477,7 +503,7 @@ static string formatInt(asINT64 value, const string &options, asUINT width)
 	// MSVC 8.0 / 2005 or newer
 	sprintf_s(&buf[0], buf.size(), fmt.c_str(), width, value);
 #else
-	sprintf(&buf[0], fmt.c_str(), width, value);
+	snprintf(&buf[0], buf.size(), fmt.c_str(), width, value);
 #endif
 	buf.resize(strlen(&buf[0]));
 
@@ -521,7 +547,7 @@ static string formatUInt(asQWORD value, const string &options, asUINT width)
 	// MSVC 8.0 / 2005 or newer
 	sprintf_s(&buf[0], buf.size(), fmt.c_str(), width, value);
 #else
-	sprintf(&buf[0], fmt.c_str(), width, value);
+	snprintf(&buf[0], buf.size(), fmt.c_str(), width, value);
 #endif
 	buf.resize(strlen(&buf[0]));
 
@@ -557,7 +583,7 @@ static string formatFloat(double value, const string &options, asUINT width, asU
 	// MSVC 8.0 / 2005 or newer
 	sprintf_s(&buf[0], buf.size(), fmt.c_str(), width, precision, value);
 #else
-	sprintf(&buf[0], fmt.c_str(), width, precision, value);
+	snprintf(&buf[0], buf.size(), fmt.c_str(), width, precision, value);
 #endif
 	buf.resize(strlen(&buf[0]));
 
@@ -757,8 +783,8 @@ void RegisterStdString_Native(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("string", "void resize(uint)", asFUNCTION(StringResize), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 #if AS_USE_STLNAMES != 1 && AS_USE_ACCESSORS == 1
 	// Don't register these if STL names is used, as they conflict with the method size()
-	r = engine->RegisterObjectMethod("string", "uint get_length() const", asFUNCTION(StringLength), asCALL_CDECL_OBJLAST); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("string", "void set_length(uint)", asFUNCTION(StringResize), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("string", "uint get_length() const property", asFUNCTION(StringLength), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("string", "void set_length(uint) property", asFUNCTION(StringResize), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 #endif
 	// Need to use a wrapper on Mac OS X 10.7/XCode 4.3 and CLang/LLVM, otherwise the linker fails
 //	r = engine->RegisterObjectMethod("string", "bool isEmpty() const", asMETHOD(string, empty), asCALL_THISCALL); assert( r >= 0 );
@@ -769,6 +795,7 @@ void RegisterStdString_Native(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("string", "uint8 &opIndex(uint)", asFUNCTION(StringCharAt), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("string", "const uint8 &opIndex(uint) const", asFUNCTION(StringCharAt), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 
+#if AS_NO_IMPL_OPS_WITH_STRING_AND_PRIMITIVE == 0
 	// Automatic conversion from values
 	r = engine->RegisterObjectMethod("string", "string &opAssign(double)", asFUNCTION(AssignDoubleToString), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("string", "string &opAddAssign(double)", asFUNCTION(AddAssignDoubleToString), asCALL_CDECL_OBJLAST); assert( r >= 0 );
@@ -794,6 +821,7 @@ void RegisterStdString_Native(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("string", "string &opAddAssign(bool)", asFUNCTION(AddAssignBoolToString), asCALL_CDECL_OBJLAST); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("string", "string opAdd(bool) const", asFUNCTION(AddStringBool), asCALL_CDECL_OBJFIRST); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("string", "string opAdd_r(bool) const", asFUNCTION(AddBoolString), asCALL_CDECL_OBJLAST); assert( r >= 0 );
+#endif
 
 	// Utilities
 	r = engine->RegisterObjectMethod("string", "string substr(uint start = 0, int count = -1) const", asFUNCTION(StringSubString), asCALL_CDECL_OBJLAST); assert( r >= 0 );
@@ -1040,6 +1068,7 @@ static void StringCharAtGeneric(asIScriptGeneric * gen)
 	}
 }
 
+#if AS_NO_IMPL_OPS_WITH_STRING_AND_PRIMITIVE == 0
 static void AssignInt2StringGeneric(asIScriptGeneric *gen)
 {
 	asINT64 *a = static_cast<asINT64*>(gen->GetAddressOfArg(0));
@@ -1239,6 +1268,7 @@ static void AddBool2StringGeneric(asIScriptGeneric * gen)
 	std::string ret_val = sstr.str();
 	gen->SetReturnObject(&ret_val);
 }
+#endif
 
 static void StringSubString_Generic(asIScriptGeneric *gen)
 {
@@ -1278,8 +1308,8 @@ void RegisterStdString_Generic(asIScriptEngine *engine)
 #endif
 	r = engine->RegisterObjectMethod("string", "void resize(uint)",   asFUNCTION(StringResizeGeneric), asCALL_GENERIC); assert( r >= 0 );
 #if AS_USE_STLNAMES != 1 && AS_USE_ACCESSORS == 1
-	r = engine->RegisterObjectMethod("string", "uint get_length() const", asFUNCTION(StringLengthGeneric), asCALL_GENERIC); assert( r >= 0 );
-	r = engine->RegisterObjectMethod("string", "void set_length(uint)", asFUNCTION(StringResizeGeneric), asCALL_GENERIC); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("string", "uint get_length() const property", asFUNCTION(StringLengthGeneric), asCALL_GENERIC); assert( r >= 0 );
+	r = engine->RegisterObjectMethod("string", "void set_length(uint) property", asFUNCTION(StringResizeGeneric), asCALL_GENERIC); assert( r >= 0 );
 #endif
 	r = engine->RegisterObjectMethod("string", "bool isEmpty() const", asFUNCTION(StringIsEmptyGeneric), asCALL_GENERIC); assert( r >= 0 );
 
@@ -1287,6 +1317,7 @@ void RegisterStdString_Generic(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("string", "uint8 &opIndex(uint)", asFUNCTION(StringCharAtGeneric), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("string", "const uint8 &opIndex(uint) const", asFUNCTION(StringCharAtGeneric), asCALL_GENERIC); assert( r >= 0 );
 
+#if AS_NO_IMPL_OPS_WITH_STRING_AND_PRIMITIVE == 0
 	// Automatic conversion from values
 	r = engine->RegisterObjectMethod("string", "string &opAssign(double)", asFUNCTION(AssignDouble2StringGeneric), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("string", "string &opAddAssign(double)", asFUNCTION(AddAssignDouble2StringGeneric), asCALL_GENERIC); assert( r >= 0 );
@@ -1312,6 +1343,7 @@ void RegisterStdString_Generic(asIScriptEngine *engine)
 	r = engine->RegisterObjectMethod("string", "string &opAddAssign(bool)", asFUNCTION(AddAssignBool2StringGeneric), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("string", "string opAdd(bool) const", asFUNCTION(AddString2BoolGeneric), asCALL_GENERIC); assert( r >= 0 );
 	r = engine->RegisterObjectMethod("string", "string opAdd_r(bool) const", asFUNCTION(AddBool2StringGeneric), asCALL_GENERIC); assert( r >= 0 );
+#endif
 
 	r = engine->RegisterObjectMethod("string", "string substr(uint start = 0, int count = -1) const", asFUNCTION(StringSubString_Generic), asCALL_GENERIC); assert(r >= 0);
 	r = engine->RegisterObjectMethod("string", "int findFirst(const string &in, uint start = 0) const", asFUNCTION(StringFindFirst_Generic), asCALL_GENERIC); assert(r >= 0);
